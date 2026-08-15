@@ -16,6 +16,9 @@ import traceback
 import socket
 import struct
 import base64
+import hashlib
+import tempfile
+import zipfile
 
 import numpy as np
 import tkinter as tk
@@ -275,6 +278,12 @@ class Game(tk.Tk):
         self.coop_player_id = None
         self.coop_player_name = None
         self.coop_assigned_player = None
+        self.coop_pack_name = None
+        self.coop_pack_tmp = None
+        self.coop_pack_file = None
+        self.coop_pack_received = 0
+        self.coop_pack_size = 0
+        self.coop_pack_hash = ""
         self.buttons = []
         self.chips = []
 
@@ -1532,8 +1541,11 @@ class CoopServer:
         while self.running:
             try:
                 conn, addr = self.sock.accept()
-                pid = str(self.next_id); self.next_id += 1
-                threading.Thread(target=self._client_loop, args=(pid,conn,addr), daemon=True).start()
+                pid = str(self.next_id)
+                self.next_id += 1
+                threading.Thread(
+                    target=self._client_loop, args=(pid, conn, addr), daemon=True
+                ).start()
             except OSError:
                 break
 
@@ -1541,22 +1553,38 @@ class CoopServer:
         try:
             msg = _recv_msg(conn)
             if not msg or msg.get("type") != "HELLO":
-                conn.close(); return
-            name = str(msg.get("name") or ("Player "+pid))[:32]
+                conn.close()
+                return
+            name = str(msg.get("name") or ("Player " + pid))[:32]
+            info = {
+                "conn": conn,
+                "name": name,
+                "addr": addr,
+                "send_lock": threading.Lock(),
+            }
             with self.lock:
-                self.clients[pid] = {"conn": conn, "name": name, "addr": addr, "send_lock": threading.Lock()}
+                self.clients[pid] = info
             self.game.after(0, self._on_join)
-            _send_msg(conn, {"type":"WELCOME","player":pid,"pack": self.game.pack.name if self.game.pack else ""}, self.clients[pid]["send_lock"])
-            self.broadcast({"type":"PLAYERS","players":[{"id":"host","name":"Host"}]+[
-                {"id":k,"name":v["name"]} for k,v in self.clients.items()]})
+            _send_msg(conn, {
+                "type": "WELCOME",
+                "player": pid,
+            }, info["send_lock"])
+            self.broadcast({
+                "type": "PLAYERS",
+                "players": [{"id": "host", "name": "Host"}] + [
+                    {"id": k, "name": v["name"]} for k, v in self.clients.items()
+                ]
+            })
+
             while self.running:
                 msg = _recv_msg(conn)
-                if not msg: break
+                if not msg:
+                    break
                 if msg.get("type") == "TAKE":
                     try:
                         idx = int(msg.get("index"))
                         audio = np.frombuffer(
-                            base64.b64decode(msg.get("audio","")),
+                            base64.b64decode(msg.get("audio", "")),
                             dtype=np.float32
                         ).copy()
                         expected = int(msg.get("samples", len(audio)))
@@ -1566,38 +1594,38 @@ class CoopServer:
                             _send_msg(conn, {
                                 "type": "TAKE_REJECT",
                                 "index": idx,
-                                "reason": "not your turn"
-                            }, self.clients[pid]["send_lock"])
+                                "reason": "not your turn",
+                            }, info["send_lock"])
                             continue
 
                         if not (self.game.pack and 0 <= idx < len(self.game.pack.lines)):
                             _send_msg(conn, {
                                 "type": "TAKE_REJECT",
                                 "index": idx,
-                                "reason": "invalid line"
-                            }, self.clients[pid]["send_lock"])
+                                "reason": "invalid line",
+                            }, info["send_lock"])
                             continue
 
                         if len(audio) != expected or not len(audio):
                             _send_msg(conn, {
                                 "type": "TAKE_REJECT",
                                 "index": idx,
-                                "reason": "invalid audio data"
-                            }, self.clients[pid]["send_lock"])
+                                "reason": "invalid audio data",
+                            }, info["send_lock"])
                             continue
 
-                        # Commit the audio on the HOST before acknowledging.
-                        # The ACK therefore means the host really has the take.
+                        # Commit on HOST first. ACK means the take is really stored.
                         self.game.pack.lines[idx].take = audio
                         _send_msg(conn, {
                             "type": "TAKE_ACK",
                             "index": idx,
                             "samples": int(len(audio)),
                             "next_index": int(msg.get("next_index", idx + 1)),
-                        }, self.clients[pid]["send_lock"])
+                        }, info["send_lock"])
 
-                        # Update/render on the Tk thread and advance everybody
-                        # only after the host has accepted the audio.
+                        # Send the accepted take to everyone else.
+                        self.send_take(idx, audio, exclude=pid)
+
                         next_index = int(msg.get("next_index", idx + 1))
                         if msg.get("advance"):
                             if next_index >= len(self.game.pack.lines):
@@ -1611,123 +1639,231 @@ class CoopServer:
                             _send_msg(conn, {
                                 "type": "TAKE_REJECT",
                                 "index": int(msg.get("index", -1)),
-                                "reason": str(ex)
-                            }, self.clients[pid]["send_lock"])
+                                "reason": str(ex),
+                            }, info["send_lock"])
                         except Exception:
                             pass
-        except Exception:
-            pass
+        except Exception as ex:
+            try:
+                self.game.after(0, self.game.coop_error, str(ex))
+            except Exception:
+                pass
         finally:
             with self.lock:
                 self.clients.pop(pid, None)
-            try: conn.close()
-            except Exception: pass
+            try:
+                conn.close()
+            except Exception:
+                pass
             self.game.after(0, self._on_join)
 
     def _on_join(self):
         if self.game.coop_window:
             self.game.coop_refresh_players()
 
-    def broadcast(self, msg):
-        raw = []
+    def broadcast(self, msg, exclude=None):
         with self.lock:
-            for pid, info in list(self.clients.items()):
-                try: _send_msg(info["conn"], msg, info.get("send_lock"))
-                except Exception: pass
+            items = list(self.clients.items())
+        for pid, info in items:
+            if exclude is not None and pid == exclude:
+                continue
+            try:
+                _send_msg(info["conn"], msg, info.get("send_lock"))
+            except Exception:
+                pass
 
     def send(self, msg):
         self.broadcast(msg)
 
-    def send_take(self, index, data):
-        arr=np.asarray(data,dtype=np.float32).reshape(-1).copy()
-        msg={"type":"TAKE","index":int(index),"samples":int(arr.size),
-             "audio":base64.b64encode(arr.tobytes()).decode("ascii")}
-        self.broadcast(msg)
+    def send_take(self, index, data, exclude=None):
+        arr = np.asarray(data, dtype=np.float32).reshape(-1).copy()
+        msg = {
+            "type": "TAKE",
+            "index": int(index),
+            "samples": int(arr.size),
+            "audio": base64.b64encode(arr.tobytes()).decode("ascii"),
+        }
+        self.broadcast(msg, exclude=exclude)
+
+    def send_pack(self, folder):
+        """Send a complete Dub-Pack after START, in small ordered chunks."""
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(folder)
+
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="dubstage_pack_", suffix=".zip", delete=False
+        )
+        zip_path = tmp.name
+        tmp.close()
+
+        try:
+            root_name = os.path.basename(os.path.normpath(folder))
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                for dp, dns, fns in os.walk(folder):
+                    for fn in fns:
+                        path = os.path.join(dp, fn)
+                        arc = os.path.join(
+                            root_name, os.path.relpath(path, folder)
+                        ).replace("\\", "/")
+                        z.write(path, arc)
+
+            size = os.path.getsize(zip_path)
+            sha = hashlib.sha256()
+            with open(zip_path, "rb") as f:
+                while True:
+                    b = f.read(1024 * 1024)
+                    if not b:
+                        break
+                    sha.update(b)
+
+            digest = sha.hexdigest()
+            with self.lock:
+                items = list(self.clients.items())
+
+            chunk_size = 256 * 1024
+            for pid, info in items:
+                lock = info.get("send_lock")
+                _send_msg(info["conn"], {
+                    "type": "PACK_BEGIN",
+                    "name": root_name,
+                    "size": size,
+                    "sha256": digest,
+                }, lock)
+
+                offset = 0
+                with open(zip_path, "rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        _send_msg(info["conn"], {
+                            "type": "PACK_CHUNK",
+                            "offset": offset,
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                        }, lock)
+                        offset += len(chunk)
+
+                _send_msg(info["conn"], {
+                    "type": "PACK_END",
+                    "size": size,
+                    "sha256": digest,
+                }, lock)
+        finally:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
 
     def close(self):
-        self.running=False
-        try: self.sock.close()
-        except Exception: pass
+        self.running = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
         with self.lock:
-            for v in self.clients.values():
-                try: v["conn"].close()
-                except Exception: pass
+            values = list(self.clients.values())
             self.clients.clear()
+        for v in values:
+            try:
+                v["conn"].close()
+            except Exception:
+                pass
 
 
 class CoopClient:
     def __init__(self, game, host, port, name):
-        self.game=game; self.host=host; self.port=int(port); self.name=name
-        self.sock=None; self.running=False
+        self.game = game
+        self.host = host
+        self.port = int(port)
+        self.name = name
+        self.sock = None
+        self.running = False
+        self.send_lock = threading.Lock()
 
     def start(self):
-        self.sock=socket.create_connection((self.host,self.port),timeout=6)
+        self.sock = socket.create_connection((self.host, self.port), timeout=6)
         self.sock.settimeout(None)
-        self.running=True
-        _send_msg(self.sock,{"type":"HELLO","name":self.name})
-        threading.Thread(target=self._loop,daemon=True).start()
+        self.running = True
+        _send_msg(self.sock, {"type": "HELLO", "name": self.name}, self.send_lock)
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
         try:
             while self.running:
-                msg=_recv_msg(self.sock)
-                if not msg: break
-                self.game.after(0,self.game.coop_message,msg)
+                msg = _recv_msg(self.sock)
+                if not msg:
+                    break
+                self.game.after(0, self.game.coop_message, msg)
         except Exception as e:
-            self.game.after(0,self.game.coop_error,str(e))
+            self.game.after(0, self.game.coop_error, str(e))
         finally:
-            self.running=False
+            self.running = False
 
-    def send(self,msg):
+    def send(self, msg):
         if self.running:
             try:
-                _send_msg(self.sock,msg)
+                _send_msg(self.sock, msg, self.send_lock)
                 return True
             except Exception as e:
                 self.running = False
-                try: self.game.after(0,self.game.coop_error,str(e))
-                except Exception: pass
-                return False
+                try:
+                    self.game.after(0, self.game.coop_error, str(e))
+                except Exception:
+                    pass
         return False
 
-    def send_take(self,index,data,advance=False,next_index=None):
-        arr=np.asarray(data,dtype=np.float32).reshape(-1).copy()
-        msg={"type":"TAKE","index":int(index),"samples":int(arr.size),
-             "audio":base64.b64encode(arr.tobytes()).decode("ascii")}
+    def send_take(self, index, data, advance=False, next_index=None):
+        arr = np.asarray(data, dtype=np.float32).reshape(-1).copy()
+        msg = {
+            "type": "TAKE",
+            "index": int(index),
+            "samples": int(arr.size),
+            "audio": base64.b64encode(arr.tobytes()).decode("ascii"),
+        }
         if advance:
             msg["advance"] = True
-            msg["next_index"] = int(index + 1 if next_index is None else next_index)
+            msg["next_index"] = int(
+                index + 1 if next_index is None else next_index
+            )
         return self.send(msg)
 
     def close(self):
-        self.running=False
-        try:self.sock.close()
-        except:pass
+        self.running = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 def _send_msg(sock, obj, lock=None):
-    raw=json.dumps(obj,separators=(",",":")).encode("utf-8")
-    packet=struct.pack("!I",len(raw))+raw
+    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    packet = struct.pack("!I", len(raw)) + raw
     if lock is None:
         sock.sendall(packet)
     else:
         with lock:
             sock.sendall(packet)
 
-def _recv_exact(sock,n):
-    b=b""
-    while len(b)<n:
-        x=sock.recv(n-len(b))
-        if not x:return None
-        b+=x
+
+def _recv_exact(sock, n):
+    b = b""
+    while len(b) < n:
+        x = sock.recv(n - len(b))
+        if not x:
+            return None
+        b += x
     return b
 
+
 def _recv_msg(sock):
-    h=_recv_exact(sock,4)
-    if not h:return None
-    n=struct.unpack("!I",h)[0]
-    if n>50_000_000: raise ValueError("packet too large")
-    b=_recv_exact(sock,n)
+    h = _recv_exact(sock, 4)
+    if not h:
+        return None
+    n = struct.unpack("!I", h)[0]
+    if n > 50_000_000:
+        raise ValueError("packet too large")
+    b = _recv_exact(sock, n)
     return json.loads(b.decode("utf-8")) if b else None
 
 
@@ -1802,22 +1938,45 @@ def _coop_start(self):
         return
     self._coop_prepare_start(host=True)
 
-def _coop_prepare_start(self,host=False,pack_name=None):
+def _coop_prepare_start(self, host=False, pack_name=None, client_folder=None):
+    """Prepare a pack locally. Clients use the folder received from Host."""
     if host:
-        self.pack=self.packs[self.sel_pack]
-    else:
-        packs=ds.find_packs(extra_dirs=self.cfg.get("extra_dirs") or [])
-        self.packs=packs
-        self.pack=next((p for p in packs if p.name==pack_name),None)
+        self.pack = self.packs[self.sel_pack]
+    elif client_folder:
+        self.pack = ds.load_pack(client_folder)
         if self.pack is None:
-            messagebox.showerror("Co-op",f"Pack not found locally:\n{pack_name}"); return
-    self.line_i=0
+            raise RuntimeError("Полученный Dub-Pack не распознан.")
+    else:
+        # Backwards-compatible fallback for old sessions where the client
+        # already had the pack locally.
+        packs = ds.find_packs(extra_dirs=self.cfg.get("extra_dirs") or [])
+        self.packs = packs
+        self.pack = next((p for p in packs if p.name == pack_name), None)
+        if self.pack is None:
+            raise RuntimeError(
+                "Dub-Pack не найден локально. Ожидается передача пака от Host."
+            )
+
+    self.line_i = 0
+
     def work():
         ds.load_pack_audio(self.pack)
-        ds.extract_frames(self.pack,fps=max(8,min(30,int(self.cfg.get("video_fps") or ds.FRAME_FPS))))
+        ds.extract_frames(
+            self.pack,
+            fps=max(8, min(30, int(
+                self.cfg.get("video_fps") or ds.FRAME_FPS
+            )))
+        )
+        if host and isinstance(self.coop, CoopServer):
+            # Archive in the worker thread so the GUI never freezes.
+            self._coop_pack_archive_ready = self.pack.folder
+
     def done():
-        for l in self.pack.lines:l.take=None
-        self._imgcache={}; self._probe_frame_size(); self.build_stage()
+        for l in self.pack.lines:
+            l.take = None
+        self._imgcache = {}
+        self._probe_frame_size()
+        self.build_stage()
         self.coop_pending_next = False
         try:
             if self.coop_role == "client":
@@ -1826,30 +1985,212 @@ def _coop_prepare_start(self,host=False,pack_name=None):
         except Exception:
             pass
         self.coop_refresh_players()
-    self._run_bg(work,done)
-    if host:
-        self.coop.send({"type":"START","pack":self.pack.name})
 
-def _coop_message(self,msg):
-    typ=msg.get("type")
-    if typ=="WELCOME":
-        self.coop_player_id=msg.get("player"); self.coop_status.config(text=f"Connected as {self.coop_player_id}",fg=TEAL); return
-    if typ=="PLAYERS":
-        self.coop_refresh_players(); return
-    if typ=="START":
-        self._coop_prepare_start(host=False,pack_name=msg.get("pack")); 
-        if self.coop_window: self.coop_window.destroy(); self.coop_window=None
+        if host and isinstance(self.coop, CoopServer):
+            # Keep the original working handshake: first announce START,
+            # then stream the pack. The client never needs it beforehand.
+            self.coop.send({"type": "START", "pack": self.pack.name})
+            threading.Thread(
+                target=self.coop.send_pack,
+                args=(self.pack.folder,),
+                daemon=True,
+            ).start()
+
+    self._run_bg(work, done)
+
+
+def _coop_message(self, msg):
+    typ = msg.get("type")
+
+    if typ == "WELCOME":
+        self.coop_player_id = msg.get("player")
+        self.coop_status.config(
+            text=f"Connected as {self.coop_player_id}", fg=TEAL
+        )
         return
-    if typ=="LINE":
-        if self.pack: self.goto_line(int(msg["index"]))
+
+    if typ == "PLAYERS":
+        self.coop_refresh_players()
         return
-    if typ=="ASSIGN":
-        self.coop_assigned_player=msg.get("player")
-        if self.pack:self.sync()
+
+    if typ == "START":
+        # The START packet is only a session announcement. Do NOT try to find
+        # the pack locally. The following PACK_* packets contain it.
+        self.coop_pack_name = msg.get("pack", "Dub-Pack")
+        self.coop_pack_tmp = None
+        self.coop_pack_file = None
+        self.coop_pack_received = 0
+        self.coop_pack_size = 0
+        self.coop_pack_hash = msg.get("sha256", "")
+        if self.coop_window:
+            self.coop_status.config(
+                text=f"Получаю пак: {self.coop_pack_name}", fg=GOLD
+            )
         return
-    if typ=="TAKE_ACK":
-        # The host has already committed the WAV at this point. Only now may
-        # the client leave the current line.
+
+    if typ == "PACK_BEGIN":
+        try:
+            name = str(msg.get("name") or "DubPack")
+            size = int(msg.get("size", 0))
+            if size <= 0:
+                raise ValueError("Пустой Dub-Pack.")
+
+            # Keep the temporary copy outside the application directory.
+            root = tempfile.mkdtemp(prefix="dubstage_coop_")
+            zip_path = os.path.join(root, "pack.zip")
+            self.coop_pack_tmp = root
+            self.coop_pack_file = open(zip_path, "wb")
+            self.coop_pack_received = 0
+            self.coop_pack_size = size
+            self.coop_pack_hash = str(msg.get("sha256") or "")
+
+            if self.coop_window:
+                self.coop_status.config(
+                    text=f"Получаю пак: 0% — {name}", fg=GOLD
+                )
+        except Exception as ex:
+            self.coop_error(f"PACK_BEGIN: {ex}")
+        return
+
+    if typ == "PACK_CHUNK":
+        try:
+            if self.coop_pack_file is None:
+                raise RuntimeError("Получен PACK_CHUNK до PACK_BEGIN.")
+            offset = int(msg.get("offset", -1))
+            if offset != self.coop_pack_received:
+                raise RuntimeError(
+                    f"Неверное смещение пакета: {offset}, "
+                    f"ожидалось {self.coop_pack_received}."
+                )
+            chunk = base64.b64decode(msg.get("data", ""))
+            self.coop_pack_file.write(chunk)
+            self.coop_pack_received += len(chunk)
+
+            if self.coop_window and self.coop_pack_size:
+                pct = int(
+                    self.coop_pack_received * 100 / self.coop_pack_size
+                )
+                self.coop_status.config(
+                    text=f"Получаю пак: {pct}%", fg=GOLD
+                )
+        except Exception as ex:
+            self.coop_error(f"PACK_CHUNK: {ex}")
+        return
+
+    if typ == "PACK_END":
+        # Verify/extract off the Tk thread. A large pack must never freeze the
+        # client window while START is being processed.
+        try:
+            if self.coop_pack_file is None or not self.coop_pack_tmp:
+                raise RuntimeError("PACK_END без PACK_BEGIN.")
+
+            self.coop_pack_file.close()
+            self.coop_pack_file = None
+            zip_path = os.path.join(self.coop_pack_tmp, "pack.zip")
+            expected_size = int(msg.get("size", self.coop_pack_size))
+            expected_hash = str(msg.get("sha256") or self.coop_pack_hash)
+            pack_tmp = self.coop_pack_tmp
+
+            if self.coop_window:
+                self.coop_status.config(
+                    text="Пак получен — проверяю…", fg=GOLD
+                )
+
+            def unpack_work():
+                actual_size = os.path.getsize(zip_path)
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"Размер пака не совпадает: {actual_size} != {expected_size}"
+                    )
+
+                sha = hashlib.sha256()
+                with open(zip_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        sha.update(chunk)
+                if expected_hash and sha.hexdigest() != expected_hash:
+                    raise RuntimeError("SHA-256 пака не совпадает.")
+
+                extract_root = os.path.join(pack_tmp, "unpacked")
+                os.makedirs(extract_root, exist_ok=True)
+
+                # Prevent Zip Slip/path traversal.
+                root_abs = os.path.abspath(extract_root)
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    for member in z.infolist():
+                        target = os.path.abspath(
+                            os.path.join(extract_root, member.filename)
+                        )
+                        if not (
+                            target == root_abs
+                            or target.startswith(root_abs + os.sep)
+                        ):
+                            raise RuntimeError(
+                                "Небезопасный путь внутри Dub-Pack."
+                            )
+                    z.extractall(extract_root)
+
+                dirs = [
+                    os.path.join(extract_root, x)
+                    for x in os.listdir(extract_root)
+                    if os.path.isdir(os.path.join(extract_root, x))
+                ]
+                if len(dirs) == 1:
+                    return dirs[0]
+                return extract_root
+
+            def unpack_done():
+                folder = getattr(self, "_coop_received_pack_folder", None)
+                if not folder:
+                    self.coop_error("Не удалось распаковать Dub-Pack.")
+                    return
+                if self.coop_window:
+                    self.coop_status.config(
+                        text="Пак распакован — подготавливаю сцену…",
+                        fg=TEAL,
+                    )
+                self._coop_prepare_start(
+                    host=False,
+                    pack_name=self.coop_pack_name,
+                    client_folder=folder,
+                )
+                if self.coop_window:
+                    self.coop_window.destroy()
+                    self.coop_window = None
+
+            def unpack_wrapper():
+                try:
+                    self._coop_received_pack_folder = unpack_work()
+                    self.msgq.put(("done", unpack_done))
+                except Exception as ex:
+                    traceback.print_exc()
+                    self.msgq.put((
+                        "done",
+                        lambda ex=ex: self.coop_error(f"PACK_END: {ex}")
+                    ))
+
+            threading.Thread(target=unpack_wrapper, daemon=True).start()
+        except Exception as ex:
+            if self.coop_pack_file:
+                try:
+                    self.coop_pack_file.close()
+                except Exception:
+                    pass
+                self.coop_pack_file = None
+            self.coop_error(f"PACK_END: {ex}")
+        return
+
+    if typ == "LINE":
+        if self.pack:
+            self.goto_line(int(msg["index"]))
+        return
+
+    if typ == "ASSIGN":
+        self.coop_assigned_player = msg.get("player")
+        if self.pack:
+            self.sync()
+        return
+
+    if typ == "TAKE_ACK":
         self.coop_pending_next = False
         next_index = int(msg.get("next_index", self.line_i + 1))
         self._overlay(None)
@@ -1860,16 +2201,19 @@ def _coop_message(self,msg):
         if next_index >= len(self.pack.lines):
             self.build_finale()
         else:
-            self.line_i = max(0, min(len(self.pack.lines) - 1, next_index))
+            self.line_i = max(
+                0, min(len(self.pack.lines) - 1, next_index)
+            )
             self._stop_audio()
             self.sync()
         if self.coop_window:
             self.coop_status.config(
-                text=f"Host получил аудио: реплика {int(msg.get('index',0))+1}",
-                fg=TEAL
+                text=f"Host получил аудио: реплика {int(msg.get('index', 0)) + 1}",
+                fg=TEAL,
             )
         return
-    if typ=="TAKE_REJECT":
+
+    if typ == "TAKE_REJECT":
         self.coop_pending_next = False
         self._overlay(None)
         try:
@@ -1878,24 +2222,32 @@ def _coop_message(self,msg):
             pass
         if self.coop_window:
             self.coop_status.config(
-                text=f"Host отклонил аудио: {msg.get('reason','unknown')}",
-                fg=RED
+                text=f"Host отклонил аудио: {msg.get('reason', 'unknown')}",
+                fg=RED,
             )
         else:
-            messagebox.showerror("Co-op", f"Host отклонил аудио:\n{msg.get('reason','unknown')}")
+            messagebox.showerror(
+                "Co-op",
+                f"Host отклонил аудио:\n{msg.get('reason', 'unknown')}",
+            )
         return
-    if typ=="TAKE":
+
+    if typ == "TAKE":
         try:
-            raw=base64.b64decode(msg["audio"])
-            data=np.frombuffer(raw,dtype=np.float32).copy()
-            idx=int(msg["index"])
-            expected=int(msg.get("samples",len(data)))
+            raw = base64.b64decode(msg["audio"])
+            data = np.frombuffer(raw, dtype=np.float32).copy()
+            idx = int(msg["index"])
+            expected = int(msg.get("samples", len(data)))
             if len(data) != expected:
-                raise ValueError(f"Audio packet size mismatch: {len(data)} != {expected}")
-            if self.pack and 0<=idx<len(self.pack.lines):
-                self.pack.lines[idx].take=data
+                raise ValueError(
+                    f"Audio packet size mismatch: {len(data)} != {expected}"
+                )
+            if self.pack and 0 <= idx < len(self.pack.lines):
+                self.pack.lines[idx].take = data
                 self.sync()
-        except Exception: traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+
 
 def _coop_error(self,err):
     if self.coop_window:
