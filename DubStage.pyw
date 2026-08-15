@@ -1242,8 +1242,9 @@ class Game(tk.Tk):
         line = self.current_line()
         if line is not None and data is not None and len(data):
             line.take = data
-            if self.coop is not None:
-                self.coop.send_take(self.line_i, data)
+            # In co-op a client sends the take only when it presses NEXT.
+            # This makes NEXT the commit/advance action: the client remains
+            # on the current line until the host has received the audio.
         self._play = None
         self._set_phase("idle")
         try:
@@ -1276,10 +1277,44 @@ class Game(tk.Tk):
             self.goto_line(self.line_i - 1)
 
     def next_line(self):
-        if self.coop is not None and self.coop_role != "host":
-            return
         if self.phase != "idle":
             return
+
+        # Co-op client: NEXT is the commit point. Send the current take to
+        # the host and stay on this line until the host acknowledges receipt.
+        if self.coop is not None and self.coop_role == "client":
+            if getattr(self, "coop_pending_next", False):
+                return
+            line = self.current_line()
+            if line is None:
+                return
+            if line.take is None or not len(line.take):
+                messagebox.showwarning("Co-op", "Сначала сделай запись этой реплики.")
+                return
+            if not getattr(self, "coop_assigned_player", None) == self.coop_player_id:
+                messagebox.showwarning("Co-op", "Сейчас очередь другого игрока.")
+                return
+            next_index = self.line_i + 1
+
+            self.coop_pending_next = True
+            try:
+                self.b_next.set_enabled(False)
+            except Exception:
+                pass
+            self._overlay("ОТПРАВКА…", GOLD, 42)
+            sent = self.coop.send_take(self.line_i, line.take, advance=True,
+                                       next_index=next_index)
+            if not sent:
+                self.coop_pending_next = False
+                try:
+                    self.b_next.set_enabled(True)
+                except Exception:
+                    pass
+                self._overlay(None)
+                messagebox.showerror("Co-op", "Не удалось отправить аудио Host.")
+            return
+
+        # Host/local mode.
         if self.line_i >= len(self.pack.lines) - 1:
             self.build_finale()
             return
@@ -1509,9 +1544,9 @@ class CoopServer:
                 conn.close(); return
             name = str(msg.get("name") or ("Player "+pid))[:32]
             with self.lock:
-                self.clients[pid] = {"conn": conn, "name": name, "addr": addr}
+                self.clients[pid] = {"conn": conn, "name": name, "addr": addr, "send_lock": threading.Lock()}
             self.game.after(0, self._on_join)
-            _send_msg(conn, {"type":"WELCOME","player":pid,"pack": self.game.pack.name if self.game.pack else ""})
+            _send_msg(conn, {"type":"WELCOME","player":pid,"pack": self.game.pack.name if self.game.pack else ""}, self.clients[pid]["send_lock"])
             self.broadcast({"type":"PLAYERS","players":[{"id":"host","name":"Host"}]+[
                 {"id":k,"name":v["name"]} for k,v in self.clients.items()]})
             while self.running:
@@ -1520,13 +1555,66 @@ class CoopServer:
                 if msg.get("type") == "TAKE":
                     try:
                         idx = int(msg.get("index"))
-                        audio = np.frombuffer(base64.b64decode(msg.get("audio","")), dtype=np.float32).copy()
+                        audio = np.frombuffer(
+                            base64.b64decode(msg.get("audio","")),
+                            dtype=np.float32
+                        ).copy()
+                        expected = int(msg.get("samples", len(audio)))
                         assigned = getattr(self.game, "coop_assigned_player", None)
-                        # The server accepts the take only for the currently assigned client.
-                        if assigned == pid and self.game.pack and 0 <= idx < len(self.game.pack.lines):
-                            self.game.after(0, self.game._coop_host_take, idx, audio)
-                    except Exception:
+
+                        if assigned != pid:
+                            _send_msg(conn, {
+                                "type": "TAKE_REJECT",
+                                "index": idx,
+                                "reason": "not your turn"
+                            }, self.clients[pid]["send_lock"])
+                            continue
+
+                        if not (self.game.pack and 0 <= idx < len(self.game.pack.lines)):
+                            _send_msg(conn, {
+                                "type": "TAKE_REJECT",
+                                "index": idx,
+                                "reason": "invalid line"
+                            }, self.clients[pid]["send_lock"])
+                            continue
+
+                        if len(audio) != expected or not len(audio):
+                            _send_msg(conn, {
+                                "type": "TAKE_REJECT",
+                                "index": idx,
+                                "reason": "invalid audio data"
+                            }, self.clients[pid]["send_lock"])
+                            continue
+
+                        # Commit the audio on the HOST before acknowledging.
+                        # The ACK therefore means the host really has the take.
+                        self.game.pack.lines[idx].take = audio
+                        _send_msg(conn, {
+                            "type": "TAKE_ACK",
+                            "index": idx,
+                            "samples": int(len(audio)),
+                            "next_index": int(msg.get("next_index", idx + 1)),
+                        }, self.clients[pid]["send_lock"])
+
+                        # Update/render on the Tk thread and advance everybody
+                        # only after the host has accepted the audio.
+                        next_index = int(msg.get("next_index", idx + 1))
+                        if msg.get("advance"):
+                            if next_index >= len(self.game.pack.lines):
+                                self.game.after(0, self.game.build_finale)
+                            else:
+                                self.game.after(0, self.game.goto_line, next_index)
+                        self.game.after(0, self.game.sync)
+                    except Exception as ex:
                         traceback.print_exc()
+                        try:
+                            _send_msg(conn, {
+                                "type": "TAKE_REJECT",
+                                "index": int(msg.get("index", -1)),
+                                "reason": str(ex)
+                            }, self.clients[pid]["send_lock"])
+                        except Exception:
+                            pass
         except Exception:
             pass
         finally:
@@ -1544,14 +1632,16 @@ class CoopServer:
         raw = []
         with self.lock:
             for pid, info in list(self.clients.items()):
-                try: _send_msg(info["conn"], msg)
+                try: _send_msg(info["conn"], msg, info.get("send_lock"))
                 except Exception: pass
 
     def send(self, msg):
         self.broadcast(msg)
 
     def send_take(self, index, data):
-        msg={"type":"TAKE","index":int(index),"audio":base64.b64encode(np.asarray(data,dtype=np.float32).tobytes()).decode("ascii")}
+        arr=np.asarray(data,dtype=np.float32).reshape(-1).copy()
+        msg={"type":"TAKE","index":int(index),"samples":int(arr.size),
+             "audio":base64.b64encode(arr.tobytes()).decode("ascii")}
         self.broadcast(msg)
 
     def close(self):
@@ -1590,12 +1680,24 @@ class CoopClient:
 
     def send(self,msg):
         if self.running:
-            try: _send_msg(self.sock,msg)
-            except Exception: pass
+            try:
+                _send_msg(self.sock,msg)
+                return True
+            except Exception as e:
+                self.running = False
+                try: self.game.after(0,self.game.coop_error,str(e))
+                except Exception: pass
+                return False
+        return False
 
-    def send_take(self,index,data):
-        self.send({"type":"TAKE","index":int(index),
-                   "audio":base64.b64encode(np.asarray(data,dtype=np.float32).tobytes()).decode("ascii")})
+    def send_take(self,index,data,advance=False,next_index=None):
+        arr=np.asarray(data,dtype=np.float32).reshape(-1).copy()
+        msg={"type":"TAKE","index":int(index),"samples":int(arr.size),
+             "audio":base64.b64encode(arr.tobytes()).decode("ascii")}
+        if advance:
+            msg["advance"] = True
+            msg["next_index"] = int(index + 1 if next_index is None else next_index)
+        return self.send(msg)
 
     def close(self):
         self.running=False
@@ -1603,9 +1705,14 @@ class CoopClient:
         except:pass
 
 
-def _send_msg(sock, obj):
+def _send_msg(sock, obj, lock=None):
     raw=json.dumps(obj,separators=(",",":")).encode("utf-8")
-    sock.sendall(struct.pack("!I",len(raw))+raw)
+    packet=struct.pack("!I",len(raw))+raw
+    if lock is None:
+        sock.sendall(packet)
+    else:
+        with lock:
+            sock.sendall(packet)
 
 def _recv_exact(sock,n):
     b=b""
@@ -1626,6 +1733,7 @@ def _recv_msg(sock):
 
 # ---- Game integration ----------------------------------------------------
 Game.coop_window = None
+Game.coop_pending_next = False
 
 def _coop_open(self):
     if self.coop_window is not None:
@@ -1710,6 +1818,13 @@ def _coop_prepare_start(self,host=False,pack_name=None):
     def done():
         for l in self.pack.lines:l.take=None
         self._imgcache={}; self._probe_frame_size(); self.build_stage()
+        self.coop_pending_next = False
+        try:
+            if self.coop_role == "client":
+                self.b_next.set_text(t("next") + "  ›")
+                self.b_next.set_enabled(True)
+        except Exception:
+            pass
         self.coop_refresh_players()
     self._run_bg(work,done)
     if host:
@@ -1732,10 +1847,51 @@ def _coop_message(self,msg):
         self.coop_assigned_player=msg.get("player")
         if self.pack:self.sync()
         return
+    if typ=="TAKE_ACK":
+        # The host has already committed the WAV at this point. Only now may
+        # the client leave the current line.
+        self.coop_pending_next = False
+        next_index = int(msg.get("next_index", self.line_i + 1))
+        self._overlay(None)
+        try:
+            self.b_next.set_enabled(True)
+        except Exception:
+            pass
+        if next_index >= len(self.pack.lines):
+            self.build_finale()
+        else:
+            self.line_i = max(0, min(len(self.pack.lines) - 1, next_index))
+            self._stop_audio()
+            self.sync()
+        if self.coop_window:
+            self.coop_status.config(
+                text=f"Host получил аудио: реплика {int(msg.get('index',0))+1}",
+                fg=TEAL
+            )
+        return
+    if typ=="TAKE_REJECT":
+        self.coop_pending_next = False
+        self._overlay(None)
+        try:
+            self.b_next.set_enabled(True)
+        except Exception:
+            pass
+        if self.coop_window:
+            self.coop_status.config(
+                text=f"Host отклонил аудио: {msg.get('reason','unknown')}",
+                fg=RED
+            )
+        else:
+            messagebox.showerror("Co-op", f"Host отклонил аудио:\n{msg.get('reason','unknown')}")
+        return
     if typ=="TAKE":
         try:
-            data=np.frombuffer(base64.b64decode(msg["audio"]),dtype=np.float32).copy()
+            raw=base64.b64decode(msg["audio"])
+            data=np.frombuffer(raw,dtype=np.float32).copy()
             idx=int(msg["index"])
+            expected=int(msg.get("samples",len(data)))
+            if len(data) != expected:
+                raise ValueError(f"Audio packet size mismatch: {len(data)} != {expected}")
             if self.pack and 0<=idx<len(self.pack.lines):
                 self.pack.lines[idx].take=data
                 self.sync()
