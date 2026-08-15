@@ -14,6 +14,8 @@ import queue
 import threading
 import traceback
 import socket
+import struct
+import base64
 
 import numpy as np
 import tkinter as tk
@@ -22,7 +24,6 @@ from tkinter import ttk, messagebox, filedialog
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubforge_core as pc
 import dubstage_core as ds
-import dubstage_net as dn
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(APP_DIR, "dubstage_settings.json")
@@ -130,23 +131,6 @@ T = {
                    "Back to the menu? The takes will be lost."),
     "err":        ("Fehler", "Error"),
     "quiet_hint": ("sehr leise - lauter sprechen", "very quiet - speak up"),
-    "coop": ("Koop", "Co-op"),
-    "coop_title": ("Koop-Lobby", "Co-op Lobby"),
-    "host": ("Host", "Host"),
-    "join": ("Beitreten", "Join"),
-    "name": ("Name", "Name"),
-    "ip": ("Host-IP", "Host IP"),
-    "port": ("Port", "Port"),
-    "create": ("Lobby erstellen", "Create lobby"),
-    "connect": ("Verbinden", "Connect"),
-    "start_game": ("START", "START"),
-    "waiting": ("Warte auf den Host ...", "Waiting for host ..."),
-    "players": ("Spieler", "Players"),
-    "who": ("Wer spricht?", "Who speaks?"),
-    "host_only": ("Nur der Host kann die Szene steuern.", "Only the host can control the scene."),
-    "not_your_turn": ("Du bist nicht an der Reihe.", "It is not your turn."),
-    "connected": ("Verbunden", "Connected"),
-    "disconnected": ("Verbindung getrennt", "Disconnected"),
 }
 
 
@@ -286,17 +270,13 @@ class Game(tk.Tk):
         self._rec_done = True
         self._resize_job = None
         self._embedded = []
+        self.coop = None
+        self.coop_role = None
+        self.coop_player_id = None
+        self.coop_player_name = None
+        self.coop_assigned_player = None
         self.buttons = []
         self.chips = []
-        self.net = None
-        self.net_mode = None              # host | client
-        self.net_name = "Host"
-        self.net_id = None
-        self.net_players = {}              # id -> name
-        self.net_turn = None
-        self.net_port = 8765
-        self.net_host_ip = "127.0.0.1"
-        self.net_pack_name = None
 
         self.cv = tk.Canvas(self, bg=BG_BOT, highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
@@ -394,8 +374,6 @@ class Game(tk.Tk):
             self.build_stage()
         elif self.screen == "finale":
             self.build_finale()
-        elif self.screen == "coop":
-            self.open_coop()
 
     def _on_motion(self, e):
         for b in self.buttons:
@@ -428,8 +406,6 @@ class Game(tk.Tk):
         if self.screen == "stage":
             self.leave_round()
         elif self.screen == "finale":
-            self.show_menu()
-        elif self.screen == "coop":
             self.show_menu()
 
     def _on_space(self):
@@ -553,7 +529,7 @@ class Game(tk.Tk):
         by = h - 78
         self._btn(70, by, 140, 44, t("rescan"), self.scan_packs, "ghost")
         self._btn(222, by, 176, 44, t("add_folder"), self.add_folder, "ghost")
-        self._btn(410, by, 120, 44, t("coop"), self.open_coop, "ghost")
+        self._btn(410, by, 150, 44, "CO-OP", self.open_coop, "ghost")
         start = self._btn(w - 250, by, 180, 44, t("start"), self.start_round,
                           "go", font=("Segoe UI Semibold", 13))
         start.set_enabled(bool(self.packs) and self.mic.available and HAVE_PIL)
@@ -623,187 +599,9 @@ class Game(tk.Tk):
             return None
 
     # ==================================================================
-    #  CO-OP
-    # ==================================================================
-    def _net_post(self, msg):
-        self.msgq.put(("net", msg))
-
-    def _net_server_message(self, peer, msg):
-        self._net_post(("server_msg", peer, msg))
-
-    def _net_server_connect(self, peer):
-        self._net_post(("server_connect", peer))
-
-    def _net_server_close(self, peer):
-        self._net_post(("server_close", peer))
-
-    def _net_client_message(self, msg):
-        self._net_post(("client_msg", msg))
-
-    def _net_client_close(self):
-        self._net_post(("client_close", None))
-
-    def open_coop(self):
-        self._stop_audio()
-        self.screen = "coop"
-        self._clear_canvas()
-        self._backdrop()
-        w,h=self.size(); cv=self.cv
-        cv.create_text(w/2,70,text=t("coop_title"),fill=TXT,font=("Segoe UI Black",28))
-        cv.create_text(w/2,108,text=t("host_only"),fill=DIM,font=("Segoe UI",10))
-        # fields
-        def field(label,x,y,var,width=260):
-            cv.create_text(x,y,anchor="w",text=label,fill=DIM,font=("Segoe UI Semibold",10))
-            e=tk.Entry(self,bg=PANEL_HI,fg=TXT,insertbackground=TXT,relief="flat",
-                       font=("Segoe UI",11),textvariable=var)
-            self._embedded.append(e); cv.create_window(x,y+30,anchor="w",window=e,width=width,height=34)
-            return e
-        self.coop_name_var=tk.StringVar(value=self.net_name or "Host")
-        self.coop_ip_var=tk.StringVar(value="127.0.0.1")
-        self.coop_port_var=tk.StringVar(value=str(self.net_port))
-        field(t("name"),80,155,self.coop_name_var)
-        field(t("ip"),80,235,self.coop_ip_var)
-        field(t("port"),80,315,self.coop_port_var,140)
-        self._btn(80,390,180,46,t("host"),self.coop_host,"go",font=("Segoe UI Semibold",12))
-        self._btn(280,390,180,46,t("join"),self.coop_join,"primary",font=("Segoe UI Semibold",12))
-        self.coop_status=cv.create_text(80,455,anchor="w",text="",fill=DIM,font=("Segoe UI",10))
-        self.coop_players_item=cv.create_text(600,150,anchor="nw",text="",fill=TXT,
-                                              font=("Segoe UI Semibold",12),width=w-680)
-        self.coop_start_btn=self._btn(w-300,390,220,46,t("start_game"),self.coop_start,
-                                      "go",font=("Segoe UI Semibold",13))
-        self.coop_start_btn.set_enabled(False)
-        self._btn(80,h-70,130,40,"‹  "+t("menu"),self.show_menu,"flat")
-
-    def _coop_players_text(self):
-        if not self.net_players:
-            return t("players")+": —"
-        return t("players")+":\n" + "\n".join("• "+n for n in self.net_players.values())
-
-    def _refresh_coop(self):
-        if self.screen!="coop": return
-        try:
-            self.cv.itemconfigure(self.coop_players_item,text=self._coop_players_text())
-            if self.net_mode=="host":
-                self.coop_start_btn.set_enabled(bool(self.net_players) and bool(self.packs))
-        except Exception: pass
-
-    def coop_host(self):
-        try:
-            port=int(self.coop_port_var.get())
-            name=self.coop_name_var.get().strip() or "Host"
-            srv=dn.Server(self._net_server_message,self._net_server_connect,self._net_server_close)
-            srv.start("0.0.0.0",port)
-        except Exception as ex:
-            messagebox.showerror(t("err"),"Host: %s"%ex); return
-        self.net=srv; self.net_mode="host"; self.net_name=name; self.net_id="host"
-        self.net_port=port; self.net_players={"host":name}
-        self.cv.itemconfigure(self.coop_status,text="%s :%d"%(t("connected"),port),fill=TEAL)
-        self._refresh_coop()
-
-    def coop_join(self):
-        try:
-            ip=self.coop_ip_var.get().strip() or "127.0.0.1"
-            port=int(self.coop_port_var.get())
-            name=self.coop_name_var.get().strip() or "Player"
-            cli=dn.Client(self._net_client_message,self._net_client_close)
-            cli.connect(ip,port)
-        except Exception as ex:
-            messagebox.showerror(t("err"),"Join: %s"%ex); return
-        self.net=cli; self.net_mode="client"; self.net_name=name
-        self.net_host_ip=ip; self.net_port=port
-        self.cv.itemconfigure(self.coop_status,text=t("connected"),fill=TEAL)
-        self.net.send({"type":"hello","name":name})
-
-    def coop_start(self):
-        if self.net_mode!="host" or not self.net_players: return
-        self.net_pack_name=self.packs[self.sel_pack].name
-        self.net.broadcast({"type":"start","pack":self.net_pack_name})
-        self.start_round(coop_start=True)
-
-    def _net_host_broadcast_players(self):
-        if self.net and self.net_mode=="host":
-            self.net.broadcast({"type":"players","players":self.net_players})
-
-    def _handle_net_event(self, ev):
-        kind=ev[0]
-        if kind=="server_connect":
-            peer=ev[1]
-            # wait for hello
-            return
-        if kind=="server_close":
-            peer=ev[1]
-            self._net_host_broadcast_players(); self._refresh_coop()
-            return
-        if kind=="server_msg":
-            peer,msg=ev[1],ev[2]
-            if msg.get("type")=="hello":
-                pid=str(id(peer)); self.net_players[pid]=msg.get("name") or "Player"
-                peer.player_id=pid
-                peer.send({"type":"welcome","id":pid,"players":self.net_players})
-                self._net_host_broadcast_players(); self._refresh_coop()
-            elif msg.get("type")=="take":
-                self._apply_remote_take(msg)
-                self.net.broadcast(msg,exclude=peer)
-            return
-        if kind=="client_msg":
-            msg=ev[1]; typ=msg.get("type")
-            if typ=="welcome":
-                self.net_id=msg.get("id"); self.net_players=msg.get("players") or {}
-                self._refresh_coop()
-            elif typ=="players":
-                self.net_players=msg.get("players") or {}; self._refresh_coop()
-            elif typ=="start":
-                name=msg.get("pack")
-                self.net_pack_name=name
-                # locate matching pack and start locally
-                for i,p in enumerate(self.packs):
-                    if p.name==name: self.sel_pack=i; break
-                self.start_round(coop_start=True)
-            elif typ=="turn":
-                self.net_turn=msg.get("player")
-                self.sync()
-            elif typ=="take":
-                self._apply_remote_take(msg)
-            elif typ=="line":
-                self.line_i=int(msg.get("line",0)); self.net_turn=msg.get("player"); self.sync()
-            return
-        if kind=="client_close":
-            self.net=None; self.net_mode=None
-            if self.screen=="coop":
-                self.cv.itemconfigure(self.coop_status,text=t("disconnected"),fill=RED)
-
-    def _apply_remote_take(self,msg):
-        if not self.pack: return
-        idx=int(msg.get("line",-1))
-        if not (0<=idx<len(self.pack.lines)): return
-        try:
-            self.pack.lines[idx].take=dn.decode_audio(msg["audio"])
-            if self.screen=="stage": self.sync()
-        except Exception: traceback.print_exc()
-
-    def _choose_speaker(self):
-        if self.net_mode!="host" or self.screen!="stage": return
-        names=list(self.net_players.items())
-        if not names: return
-        top=tk.Toplevel(self); top.title(t("who")); top.configure(bg=BG_BOT); top.transient(self); top.grab_set()
-        tk.Label(top,text=t("who"),bg=BG_BOT,fg=TXT,font=("Segoe UI Semibold",14)).pack(padx=24,pady=(20,10))
-        var=tk.StringVar(value=self.net_turn or names[0][0])
-        for pid,name in names:
-            tk.Radiobutton(top,text=name,variable=var,value=pid,bg=BG_BOT,fg=TXT,
-                           selectcolor=PANEL,activebackground=BG_BOT,activeforeground=TXT,
-                           font=("Segoe UI",11)).pack(anchor="w",padx=30,pady=4)
-        def apply():
-            self.net_turn=var.get()
-            msg={"type":"turn","player":self.net_turn}
-            self.net.broadcast(msg)
-            self.sync(); top.destroy()
-        tk.Button(top,text=t("go"),command=apply,bg=ACC,fg="white",relief="flat").pack(pady=18,padx=24,fill="x")
-        top.protocol("WM_DELETE_WINDOW",top.destroy)
-
-    # ==================================================================
     #  RUNDE VORBEREITEN
     # ==================================================================
-    def start_round(self, coop_start=False):
+    def start_round(self):
         if not self.packs:
             return
         if not self.mic.available:
@@ -813,8 +611,6 @@ class Game(tk.Tk):
             messagebox.showerror(t("err"), t("no_pil"))
             return
         self.pack = self.packs[self.sel_pack]
-        if self.net_mode=="client" and not coop_start:
-            return
         self.cfg["mic"] = self.mic_var.get()
         save_cfg(self.cfg)
         self.cv.itemconfigure(self.status_item, text=t("loading"), fill=GOLD)
@@ -834,10 +630,7 @@ class Game(tk.Tk):
             self.line_i = 0
             self._imgcache = {}
             self._probe_frame_size()
-            self.net_turn = None if self.net_mode else None
             self.build_stage()
-            if self.net_mode=="host":
-                self.after(250, self._choose_speaker)
         self._run_bg(work, done)
 
     # ==================================================================
@@ -859,8 +652,6 @@ class Game(tk.Tk):
         self.hdr_count = cv.create_text(w - pad, 43, anchor="e", text="",
                                         fill=DIM,
                                         font=("Segoe UI Semibold", 12))
-        if self.net_mode=="host":
-            self._btn(pad+125,24,150,38,t("who"),self._choose_speaker,"ghost",font=("Segoe UI",10))
 
         # Videoflaeche
         top = 82
@@ -991,20 +782,16 @@ class Game(tk.Tk):
         # --- Knopfzustaende zuerst: die duerfen nie von der Anzeige abhaengen.
         # Aufnehmen ist auf jeder Zeile moeglich, auch auf der letzten.
         self.b_orig.set_enabled(not busy)
-        allowed=True
-        if self.net_mode:
-            allowed=(self.net_mode=="host" and self.net_turn=="host") or (self.net_mode=="client" and self.net_turn==self.net_id)
-        self.b_rec.set_enabled(not busy and line is not None and allowed)
+        can_record = (not busy and line is not None)
+        if self.coop is not None:
+            can_record = can_record and (self.coop_role == "host" or self.coop_assigned_player == self.coop_player_id)
+        self.b_rec.set_enabled(can_record)
         self.b_rec.set_text("●  " + (t("rec_again") if has_take else t("rec")))
         self.b_take.set_enabled(not busy and bool(has_take))
         self.b_prev.set_enabled(not busy and self.line_i > 0)
         self.b_skip.set_enabled(not busy and bool(has_take))
         self.b_next.set_enabled(not busy)
         self.b_next.set_text((t("finish") if last else t("next")) + "  ›")
-        if self.net_mode=="client":
-            self.b_prev.set_enabled(False); self.b_skip.set_enabled(False); self.b_next.set_enabled(False)
-            if self.net_turn!=self.net_id:
-                self.cv.itemconfigure(self.hint_item,text=t("not_your_turn"))
 
         # --- ab hier nur noch Kosmetik
         try:
@@ -1455,12 +1242,8 @@ class Game(tk.Tk):
         line = self.current_line()
         if line is not None and data is not None and len(data):
             line.take = data
-            if self.net_mode:
-                msg={"type":"take","line":self.line_i,"audio":dn.encode_audio(data)}
-                if self.net_mode=="host":
-                    self.net.broadcast(msg)
-                else:
-                    self.net.send(msg)
+            if self.coop is not None:
+                self.coop.send_take(self.line_i, data)
         self._play = None
         self._set_phase("idle")
         try:
@@ -1481,34 +1264,32 @@ class Game(tk.Tk):
             return
         self.line_i = max(0, min(len(self.pack.lines) - 1, index))
         self._stop_audio()
+        if self.coop is not None and self.coop_role == "host":
+            self.coop.send({"type": "LINE", "index": self.line_i})
+            self.coop.send({"type": "ASSIGN", "index": self.line_i, "player": self.coop_assigned_player})
         self.sync()
 
     def prev_line(self):
+        if self.coop is not None and self.coop_role != "host":
+            return
         if self.phase == "idle" and self.line_i > 0:
             self.goto_line(self.line_i - 1)
 
     def next_line(self):
-        if self.phase != "idle":
+        if self.coop is not None and self.coop_role != "host":
             return
-        if self.net_mode=="client":
+        if self.phase != "idle":
             return
         if self.line_i >= len(self.pack.lines) - 1:
             self.build_finale()
             return
         self.goto_line(self.line_i + 1)
-        if self.net_mode=="host":
-            self.net_turn=None
-            self.net.broadcast({"type":"line","line":self.line_i,"player":None})
-            self.after(150,self._choose_speaker)
 
     def leave_round(self):
         if messagebox.askyesno(t("title"), t("leave_q")):
             self._stop_audio()
             self._set_phase("idle")
-            if self.net_mode:
-                self.open_coop()
-            else:
-                self.show_menu()
+            self.show_menu()
 
     # ==================================================================
     #  FINALE
@@ -1672,8 +1453,6 @@ class Game(tk.Tk):
                 elif kind == "error":
                     messagebox.showerror(t("err"), payload)
                     self.show_menu()
-                elif kind == "net":
-                    self._handle_net_event(payload)
         except queue.Empty:
             pass
         # Notbremse: haengt eine Phase laenger als erwartet, aufraeumen.
@@ -1685,14 +1464,319 @@ class Game(tk.Tk):
         self.after(60, self._pump)
 
     def _on_close(self):
-        self._stop_audio()
         try:
-            if self.net_mode=="host": self.net.stop()
-            elif self.net_mode=="client": self.net.close()
+            if self.coop: self.coop.close()
         except Exception: pass
+        self._stop_audio()
         save_cfg(self.cfg)
         self.destroy()
 
+
+# ==========================================================================
+# CO-OP NETWORK
+# ==========================================================================
+class CoopServer:
+    def __init__(self, game, port=8765):
+        self.game = game
+        self.port = int(port)
+        self.sock = None
+        self.clients = {}
+        self.next_id = 1
+        self.running = False
+        self.lock = threading.Lock()
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", self.port))
+        self.sock.listen()
+        self.running = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+                pid = str(self.next_id); self.next_id += 1
+                threading.Thread(target=self._client_loop, args=(pid,conn,addr), daemon=True).start()
+            except OSError:
+                break
+
+    def _client_loop(self, pid, conn, addr):
+        try:
+            msg = _recv_msg(conn)
+            if not msg or msg.get("type") != "HELLO":
+                conn.close(); return
+            name = str(msg.get("name") or ("Player "+pid))[:32]
+            with self.lock:
+                self.clients[pid] = {"conn": conn, "name": name, "addr": addr}
+            self.game.after(0, self._on_join)
+            _send_msg(conn, {"type":"WELCOME","player":pid,"pack": self.game.pack.name if self.game.pack else ""})
+            self.broadcast({"type":"PLAYERS","players":[{"id":"host","name":"Host"}]+[
+                {"id":k,"name":v["name"]} for k,v in self.clients.items()]})
+            while self.running:
+                msg = _recv_msg(conn)
+                if not msg: break
+                if msg.get("type") == "TAKE":
+                    try:
+                        idx = int(msg.get("index"))
+                        audio = np.frombuffer(base64.b64decode(msg.get("audio","")), dtype=np.float32).copy()
+                        assigned = getattr(self.game, "coop_assigned_player", None)
+                        # The server accepts the take only for the currently assigned client.
+                        if assigned == pid and self.game.pack and 0 <= idx < len(self.game.pack.lines):
+                            self.game.after(0, self.game._coop_host_take, idx, audio)
+                    except Exception:
+                        traceback.print_exc()
+        except Exception:
+            pass
+        finally:
+            with self.lock:
+                self.clients.pop(pid, None)
+            try: conn.close()
+            except Exception: pass
+            self.game.after(0, self._on_join)
+
+    def _on_join(self):
+        if self.game.coop_window:
+            self.game.coop_refresh_players()
+
+    def broadcast(self, msg):
+        raw = []
+        with self.lock:
+            for pid, info in list(self.clients.items()):
+                try: _send_msg(info["conn"], msg)
+                except Exception: pass
+
+    def send(self, msg):
+        self.broadcast(msg)
+
+    def send_take(self, index, data):
+        msg={"type":"TAKE","index":int(index),"audio":base64.b64encode(np.asarray(data,dtype=np.float32).tobytes()).decode("ascii")}
+        self.broadcast(msg)
+
+    def close(self):
+        self.running=False
+        try: self.sock.close()
+        except Exception: pass
+        with self.lock:
+            for v in self.clients.values():
+                try: v["conn"].close()
+                except Exception: pass
+            self.clients.clear()
+
+
+class CoopClient:
+    def __init__(self, game, host, port, name):
+        self.game=game; self.host=host; self.port=int(port); self.name=name
+        self.sock=None; self.running=False
+
+    def start(self):
+        self.sock=socket.create_connection((self.host,self.port),timeout=6)
+        self.sock.settimeout(None)
+        self.running=True
+        _send_msg(self.sock,{"type":"HELLO","name":self.name})
+        threading.Thread(target=self._loop,daemon=True).start()
+
+    def _loop(self):
+        try:
+            while self.running:
+                msg=_recv_msg(self.sock)
+                if not msg: break
+                self.game.after(0,self.game.coop_message,msg)
+        except Exception as e:
+            self.game.after(0,self.game.coop_error,str(e))
+        finally:
+            self.running=False
+
+    def send(self,msg):
+        if self.running:
+            try: _send_msg(self.sock,msg)
+            except Exception: pass
+
+    def send_take(self,index,data):
+        self.send({"type":"TAKE","index":int(index),
+                   "audio":base64.b64encode(np.asarray(data,dtype=np.float32).tobytes()).decode("ascii")})
+
+    def close(self):
+        self.running=False
+        try:self.sock.close()
+        except:pass
+
+
+def _send_msg(sock, obj):
+    raw=json.dumps(obj,separators=(",",":")).encode("utf-8")
+    sock.sendall(struct.pack("!I",len(raw))+raw)
+
+def _recv_exact(sock,n):
+    b=b""
+    while len(b)<n:
+        x=sock.recv(n-len(b))
+        if not x:return None
+        b+=x
+    return b
+
+def _recv_msg(sock):
+    h=_recv_exact(sock,4)
+    if not h:return None
+    n=struct.unpack("!I",h)[0]
+    if n>50_000_000: raise ValueError("packet too large")
+    b=_recv_exact(sock,n)
+    return json.loads(b.decode("utf-8")) if b else None
+
+
+# ---- Game integration ----------------------------------------------------
+Game.coop_window = None
+
+def _coop_open(self):
+    if self.coop_window is not None:
+        try:self.coop_window.lift(); return
+        except:pass
+    win=tk.Toplevel(self); self.coop_window=win
+    win.title("DubStage Co-op")
+    win.geometry("520x560"); win.configure(bg=BG_BOT)
+    win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self,"coop_window",None),win.destroy()))
+    self.coop_mode=tk.StringVar(value="host")
+    tk.Label(win,text="CO-OP",bg=BG_BOT,fg=TXT,font=("Segoe UI Black",24)).pack(pady=18)
+    frm=tk.Frame(win,bg=BG_BOT); frm.pack()
+    tk.Radiobutton(frm,text="Host",variable=self.coop_mode,value="host",bg=BG_BOT,fg=TXT,selectcolor=PANEL).grid(row=0,column=0,padx=12)
+    tk.Radiobutton(frm,text="Join",variable=self.coop_mode,value="join",bg=BG_BOT,fg=TXT,selectcolor=PANEL).grid(row=0,column=1,padx=12)
+    self.coop_name=tk.StringVar(value="Player")
+    self.coop_host=tk.StringVar(value="127.0.0.1")
+    self.coop_port=tk.StringVar(value="8765")
+    for label,var in [("Name",self.coop_name),("Host IP",self.coop_host),("Port",self.coop_port)]:
+        tk.Label(win,text=label,bg=BG_BOT,fg=DIM).pack(pady=(12,2))
+        tk.Entry(win,textvariable=var,bg=PANEL_HI,fg=TXT,insertbackground=TXT).pack(ipadx=8)
+    self.coop_status=tk.Label(win,text="Not connected",bg=BG_BOT,fg=DIM); self.coop_status.pack(pady=12)
+    self.coop_players=tk.Listbox(win,bg=PANEL_HI,fg=TXT,selectbackground=ACC,height=10)
+    self.coop_players.pack(fill="x",padx=30)
+    btns=tk.Frame(win,bg=BG_BOT); btns.pack(pady=14)
+    tk.Button(btns,text="CONNECT / HOST",command=lambda:self.coop_connect(),bg=ACC,fg="white").pack(side="left",padx=5)
+    self.coop_start_btn=tk.Button(btns,text="START",command=lambda:self.coop_start(),bg=TEAL,fg="black",state="disabled")
+    self.coop_start_btn.pack(side="left",padx=5)
+    tk.Button(btns,text="Choose speaker",command=lambda:self.coop_choose_speaker(),bg=PANEL_HI,fg=TXT).pack(side="left",padx=5)
+    self.coop_refresh_players()
+
+def _coop_refresh_players(self):
+    if self.coop_window is None:return
+    try:
+        lb=self.coop_players; lb.delete(0,"end")
+        if self.coop_role=="host":
+            lb.insert("end","HOST — Host")
+            if getattr(self,"coop",None) and isinstance(self.coop,CoopServer):
+                for pid,v in self.coop.clients.items(): lb.insert("end",f"{pid} — {v['name']}")
+            self.coop_start_btn.config(state="normal" if getattr(self,"pack",None) else "normal")
+        else:
+            lb.insert("end",f"YOU — {self.coop_player_name}")
+            self.coop_start_btn.config(state="disabled")
+    except:pass
+
+def _coop_connect(self):
+    try:
+        name=self.coop_name.get().strip() or "Player"
+        port=int(self.coop_port.get())
+        if self.coop_mode.get()=="host":
+            self.coop=CoopServer(self,port); self.coop.start()
+            self.coop_role="host"; self.coop_player_id="host"; self.coop_player_name=name
+            self.coop_status.config(text=f"Hosting on port {port}",fg=TEAL)
+        else:
+            self.coop=CoopClient(self,self.coop_host.get().strip(),port,name)
+            self.coop.start()
+            self.coop_role="client"; self.coop_player_name=name
+            self.coop_status.config(text="Connected",fg=TEAL)
+        self.coop_refresh_players()
+    except Exception as e:
+        messagebox.showerror("Co-op",f"Connection failed:\n{e}")
+
+def _coop_start(self):
+    if self.coop_role!="host": return
+    if not self.packs:
+        messagebox.showwarning("Co-op","Select a Dub-Pack first.")
+        return
+    self._coop_prepare_start(host=True)
+
+def _coop_prepare_start(self,host=False,pack_name=None):
+    if host:
+        self.pack=self.packs[self.sel_pack]
+    else:
+        packs=ds.find_packs(extra_dirs=self.cfg.get("extra_dirs") or [])
+        self.packs=packs
+        self.pack=next((p for p in packs if p.name==pack_name),None)
+        if self.pack is None:
+            messagebox.showerror("Co-op",f"Pack not found locally:\n{pack_name}"); return
+    self.line_i=0
+    def work():
+        ds.load_pack_audio(self.pack)
+        ds.extract_frames(self.pack,fps=max(8,min(30,int(self.cfg.get("video_fps") or ds.FRAME_FPS))))
+    def done():
+        for l in self.pack.lines:l.take=None
+        self._imgcache={}; self._probe_frame_size(); self.build_stage()
+        self.coop_refresh_players()
+    self._run_bg(work,done)
+    if host:
+        self.coop.send({"type":"START","pack":self.pack.name})
+
+def _coop_message(self,msg):
+    typ=msg.get("type")
+    if typ=="WELCOME":
+        self.coop_player_id=msg.get("player"); self.coop_status.config(text=f"Connected as {self.coop_player_id}",fg=TEAL); return
+    if typ=="PLAYERS":
+        self.coop_refresh_players(); return
+    if typ=="START":
+        self._coop_prepare_start(host=False,pack_name=msg.get("pack")); 
+        if self.coop_window: self.coop_window.destroy(); self.coop_window=None
+        return
+    if typ=="LINE":
+        if self.pack: self.goto_line(int(msg["index"]))
+        return
+    if typ=="ASSIGN":
+        self.coop_assigned_player=msg.get("player")
+        if self.pack:self.sync()
+        return
+    if typ=="TAKE":
+        try:
+            data=np.frombuffer(base64.b64decode(msg["audio"]),dtype=np.float32).copy()
+            idx=int(msg["index"])
+            if self.pack and 0<=idx<len(self.pack.lines):
+                self.pack.lines[idx].take=data
+                self.sync()
+        except Exception: traceback.print_exc()
+
+def _coop_error(self,err):
+    if self.coop_window:
+        self.coop_status.config(text=f"Disconnected: {err}",fg=RED)
+
+def _coop_host_take(self, idx, audio):
+    if not self.pack or not (0 <= idx < len(self.pack.lines)):
+        return
+    self.pack.lines[idx].take = np.asarray(audio, dtype=np.float32)
+    if self.coop_role == "host" and isinstance(self.coop, CoopServer):
+        self.coop.send_take(idx, audio)
+    self.sync()
+
+def _coop_choose_speaker(self):
+    if self.coop_role!="host" or not isinstance(self.coop,CoopServer): return
+    choices=[("host","Host")]+[(pid,v["name"]) for pid,v in self.coop.clients.items()]
+    win=tk.Toplevel(self.coop_window or self); win.title("Who speaks?"); win.configure(bg=BG_BOT)
+    tk.Label(win,text="Choose speaker for current line",bg=BG_BOT,fg=TXT).pack(pady=12)
+    for pid,name in choices:
+        tk.Button(win,text=name,command=lambda p=pid,w=win:self._coop_assign(p,w),bg=PANEL_HI,fg=TXT,width=30).pack(pady=4)
+
+def _coop_assign(self,pid,win=None):
+    self.coop_assigned_player=pid
+    if isinstance(self.coop,CoopServer):
+        self.coop.send({"type":"ASSIGN","index":self.line_i,"player":pid})
+    self.sync()
+    if win: win.destroy()
+
+Game.open_coop=_coop_open
+Game.coop_refresh_players=_coop_refresh_players
+Game.coop_connect=_coop_connect
+Game.coop_start=_coop_start
+Game._coop_prepare_start=_coop_prepare_start
+Game.coop_message=_coop_message
+Game.coop_error=_coop_error
+Game.coop_choose_speaker=_coop_choose_speaker
+Game._coop_assign=_coop_assign
 
 if __name__ == "__main__":
     Game().mainloop()
